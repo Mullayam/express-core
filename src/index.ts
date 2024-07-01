@@ -35,7 +35,9 @@ export class FilesMapper {
     }
 
     private static async getFilesRecursively(directory: string): Promise<string[]> {
+
         const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+        console.log(entries)
         const files = entries.map(entry => {
             const res = path.resolve(directory, entry.name);
             return entry.isDirectory() ? this.getFilesRecursively(res) : Promise.resolve(res);
@@ -49,13 +51,15 @@ export class FilesMapper {
     * @return {Promise<any[]>} A promise that resolves to an array of imported modules.
     */
     static async _importModules(path: string): Promise<any[]> {
-        const files = path.includes('*') ? globSync(path) : await this.getFilesRecursively(path)
+        const files = path.includes('*') ? globSync(path, { ignore: 'node_modules/**' }) : await this.getFilesRecursively(path)
+
         const modules: any[] = [];
         for (const file of files) {
             if (file.endsWith('.ts') || file.endsWith('.js') && !file.endsWith('.d.ts') && !file.endsWith('.test.ts') && !file.endsWith('.spec.ts')) {
                 try {
                     const moduleUrl = pathToFileURL(file).href;
                     const importedModule = await import(moduleUrl);
+                    console.log(this.extractExports(importedModule))
                     modules.push(...this.extractExports(importedModule));
                 } catch (error) {
                     console.error(`Failed to import module: ${file}`, error);
@@ -125,7 +129,7 @@ export class RouteResolver {
         *   - listEndpoints: A boolean indicating whether to print the endpoints or not. Default is false.
         *   - onlyPaths: A boolean indicating whether to print only the paths of the endpoints or not. Default is false.
         */
-    static Mapper(AppServer: Application, options: { listEndpoints: boolean, onlyPaths: false } = { listEndpoints: false, onlyPaths: false }) {
+    static Mapper(AppServer: Application, options: { listEndpoints?: boolean, onlyPaths?: boolean } = { listEndpoints: false, onlyPaths: false }) {
         if (options.listEndpoints) {
             // listEndpoints(AppServer)
             this.prototype.getEndpoints(AppServer).forEach((endpoint, key, arr) => {
@@ -440,11 +444,14 @@ export function Res(): ParameterDecorator {
  * @param {string} [globalPrefix=""] - The global prefix to prepend to all routes.
  */
 export function RegisterRoutes(app: any, controllers: any[], globalPrefix: string = '') {
-     
+
     controllers.forEach(controllerClass => {
         const router = Router();
         const basePath = Reflect.getMetadata('basePath', controllerClass) as string;
         const globalMiddlewares = Reflect.getMetadata(MIDDLEWARE_KEY, controllerClass) || [];
+        // const serviceInstance = DIContainer.resolve(instanceClass);
+        // Reflect.getMetadata(controllerClass, controllerClass);
+
         const instance = new controllerClass();
         const routes: RouteDefinition[] = Reflect.getMetadata(ROUTES_KEY, controllerClass.prototype) || [];
         routes.forEach((route) => {
@@ -524,7 +531,7 @@ export function RegisterRoutes(app: any, controllers: any[], globalPrefix: strin
             const middlewares = [...globalMiddlewares, ...route.middlewares!, handler];
             router[route.method](route.path, ...middlewares);
         });
-        globalPrefix = app.get("globalPrefix") || "";
+        globalPrefix = app.get("globalPrefix") || globalPrefix;
         const normalizedPath = (globalPrefix + basePath).replace(/\/{2,}/g, '/')
         app.use(normalizedPath, router);
     })
@@ -1055,4 +1062,79 @@ export function HandleTimeout(timeout: number) {
 
         return descriptor;
     };
+}
+export function createDecorator(metadataKey: string, metadataValue: any): MethodDecorator {
+    return function (target, propertyKey, descriptor) {
+        Reflect.defineMetadata(metadataKey, metadataValue, descriptor.value!);
+    };
+}
+export function AutoLoad(app: any, controllers: any[], globalPrefix: string = '') {
+
+    controllers.forEach(controllerClass => {
+        const router = Router();
+        const basePath = Reflect.getMetadata('basePath', controllerClass) as string;
+        const globalMiddlewares = Reflect.getMetadata(MIDDLEWARE_KEY, controllerClass) || [];
+        const instance = new controllerClass();
+
+        const routes: RouteDefinition[] = Reflect.getMetadata(ROUTES_KEY, controllerClass.prototype) || [];
+        routes.forEach((route) => {
+            const handler = (req: Request, res: Response, next: NextFunction) => {
+
+                const requestParameters = Reflect.getMetadata('requestParameter', instance, route.handlerName);
+                const responseParameters = Reflect.getMetadata('responseParameter', instance, route.handlerName);
+
+
+                const bodyIndices: Record<string, number> = getIndices(instance, route.handlerName, 'body');
+                const queryIndices: Record<string, number> = getIndices(instance, route.handlerName, 'query');
+                const paramIndices: Record<string, number> = getIndices(instance, route.handlerName, 'param')
+                const headerIndices: Record<string, number> = getIndices(instance, route.handlerName, 'header')
+                const cookieIndices: Record<string, number> = getIndices(instance, route.handlerName, 'cookie')
+                const args = [];
+
+                if (requestParameters !== undefined) args[requestParameters] = req;
+                if (responseParameters !== undefined) args[responseParameters] = res;
+
+                applyIndices(args, req.body, bodyIndices, 'any');
+                applyIndices(args, req.query, queryIndices, 'any');
+                applyIndices(args, req.params, paramIndices, 'any');
+                applyIndices(args, req.headers, headerIndices, 'any');
+                applyIndices(args, req.cookies, cookieIndices, 'any');
+                const redirect = Reflect.getMetadata('redirect', instance[route.handlerName]);
+                const statusCode = Reflect.getMetadata('statusCode', instance[route.handlerName]) || 200;               
+
+                const result = (instance as any)[route.handlerName](...args);
+                
+                if (redirect) {
+                    return res.redirect(redirect);
+                }
+                if (statusCode) {
+                    return res.status(statusCode).json(result);
+                }
+                if (result instanceof Promise) {
+                    result.then((value: any) => res.json(value)).catch(next);
+                } else {
+                    res.json(result);
+                }
+            };
+            const middlewares = [...globalMiddlewares, ...route.middlewares!, handler];
+            router[route.method](route.path, ...middlewares);
+        });
+        globalPrefix = app.get("globalPrefix") || "";
+        const normalizedPath = (globalPrefix + basePath).replace(/\/{2,}/g, '/')
+        app.use(normalizedPath, router);
+    })
+}
+function getIndices(instance: any, handlerName: string, type: string): Record<string, number> {
+    return Reflect.getMetadataKeys(instance, handlerName)
+        .filter((key: string) => key.startsWith(`${type}:`))
+        .reduce((acc: Record<string, number>, key: string) => {
+            acc[key.split(':')[1]] = Reflect.getMetadata(key, instance, handlerName);
+            return acc;
+        }, {} as Record<string, number>);
+}
+function applyIndices(args: any[], source: any, indices: Record<string, number>, anyKey: string) {
+    Object.entries(indices).forEach(([name, index]) => {
+        if (name === anyKey) args[index] = source;
+        else args[index] = source[name];
+    });
 }
